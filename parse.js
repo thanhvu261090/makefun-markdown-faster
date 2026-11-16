@@ -1073,6 +1073,17 @@ function enclosedByDouble(nodes, j, pairCh) {
 // also open (or an opener that can also close) is skipped when the sum of
 // the opener and closer lengths is a multiple of three (the rule of three).
 function resolveEmphasis(nodes) {
+  // Precompute, once per call, which delimiter runs are enclosed by a
+  // double pair of the other character (a `*` inside `__...__`, or a `_`
+  // inside `**...**`): those are literal text inside that span and are
+  // skipped by the closer scan. Stored on the node so it survives the
+  // splicing below.
+  for (let j = 0; j < nodes.length; j++) {
+    const c = nodes[j];
+    if (!c || typeof c !== 'object' || !c.d) continue;
+    if (c.d === '*') c.se = enclosedByDouble(nodes, j, '_') ? 1 : 0;
+    else if (c.d === '_') c.se = enclosedByDouble(nodes, j, '*') ? 1 : 0;
+  }
   let i = 0;
   while (i < nodes.length) {
     const nd = nodes[i];
@@ -1085,10 +1096,8 @@ function resolveEmphasis(nodes) {
     for (let j = i + 1; j < nodes.length; j++) {
       const c = nodes[j];
       if (!c || typeof c !== 'object' || c.d !== ch) continue;
-      // Skip a run enclosed by a double pair of the other character
-      // (a `*` inside `__...__`, or a `_` inside `**...**`): it is
-      // literal text inside that span.
-      if (!isDel && ((ch === '*' && enclosedByDouble(nodes, j, '_')) || (ch === '_' && enclosedByDouble(nodes, j, '*')))) continue;
+      // Skip a run enclosed by a double pair of the other character.
+      if (!isDel && c.se) continue;
       if (isDel) {
         // Strikethrough: only runs of exactly the opener's length join
         // the pool (a closer must be the same length; there is no rule
