@@ -299,10 +299,15 @@ function stripTrailingBlanks(raw) {
 // Delimiter runs are resolved after the scan by resolveEmphasis().
 
 const EMAIL_LOCAL = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/;
-const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![\w-])/;
+// Sticky (y) variants: set lastIndex instead of slicing the input, so the
+// hot inline path does not allocate a substring per candidate position.
+const EMAIL_RE = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(?![\w-])/y;
 // Same as EMAIL_RE but without the trailing-word-char lookahead: used when
 // the character after the address is a closing emphasis delimiter (`_`/`*`).
-const EMAIL_RE_LONG = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+/;
+const EMAIL_RE_LONG = /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+/y;
+const WWW_RE = /www\.(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
+const SCHEME_RE = /(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/y;
+const SCHEME_PREFIX_RE = /(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\//y;
 
 // Persistent inline-lexer state: marked keeps `inLink` across paragraphs —
 // an unclosed inline `<a>` tag suppresses extended autolinks (and nested
@@ -429,12 +434,14 @@ function tryTag(s, i) {
 // --- extended autolinks (www., scheme://, mailto:, email) ----------------
 
 function matchEmailAt(s, i) {
-  const m = EMAIL_RE.exec(s.slice(i, i + 320));
+  EMAIL_RE.lastIndex = i;
+  const m = EMAIL_RE.exec(s);
   return m ? m[0] : null;
 }
 
 function matchEmailLongAt(s, i) {
-  const m = EMAIL_RE_LONG.exec(s.slice(i, i + 320));
+  EMAIL_RE_LONG.lastIndex = i;
+  const m = EMAIL_RE_LONG.exec(s);
   return m ? m[0] : null;
 }
 
@@ -457,6 +464,22 @@ function backpedal(s) {
   return s;
 }
 
+// Case-insensitive prefix checks for URL schemes, used to gate tryUrl
+// calls from the inline scanner (cheaper than a regex exec per position).
+function startsSchemeHttp(s, i) {
+  const c1 = s[i + 1], c2 = s[i + 2], c3 = s[i + 3];
+  if ((c1 !== 't' && c1 !== 'T') || (c2 !== 't' && c2 !== 'T') || (c3 !== 'p' && c3 !== 'P')) return false;
+  const c4 = s[i + 4];
+  if (c4 === ':') return s[i + 5] === '/' && s[i + 6] === '/';
+  if (c4 === 's' || c4 === 'S') return s[i + 5] === ':' && s[i + 6] === '/' && s[i + 7] === '/';
+  return false;
+}
+function startsSchemeFtp(s, i) {
+  const c1 = s[i + 1], c2 = s[i + 2];
+  if ((c1 !== 't' && c1 !== 'T') || (c2 !== 'p' && c2 !== 'P')) return false;
+  return s[i + 3] === ':' && s[i + 4] === '/' && s[i + 5] === '/';
+}
+
 // Try an extended autolink at `i` (the scanner is at its first character).
 // Returns {end, href, text} or null. `inLink` suppresses these. `nodes` is
 // the node list scanned so far (used to tell a closing emphasis delimiter
@@ -466,7 +489,8 @@ function tryUrl(s, i, inLink, nodes) {
   // www.
   if (s.startsWith('www.', i)) {
     if (i === 0 || ' \t\n\r*_~('.indexOf(s[i - 1]) !== -1) {
-      const m = /^www\.(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/.exec(s.slice(i));
+      WWW_RE.lastIndex = i;
+      const m = WWW_RE.exec(s);
       if (m) {
         const text = backpedal(m[0]);
         if (text.length > 4) return { end: i + text.length, href: 'http://' + text, text };
@@ -475,9 +499,10 @@ function tryUrl(s, i, inLink, nodes) {
     return null;
   }
   // scheme://
-  const scheme = /^(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\//.exec(s.slice(i, i + 8));
-  if (scheme) {
-    const m = /^(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/(?:[a-zA-Z0-9-]+\.?)+[^\s<]*/.exec(s.slice(i));
+  SCHEME_PREFIX_RE.lastIndex = i;
+  if (SCHEME_PREFIX_RE.exec(s)) {
+    SCHEME_RE.lastIndex = i;
+    const m = SCHEME_RE.exec(s);
     if (m) {
       const text = backpedal(m[0]);
       return { end: i + text.length, href: text, text };
@@ -489,6 +514,7 @@ function tryUrl(s, i, inLink, nodes) {
     if (i === 0 || !isAlnum(s[i - 1])) {
       const proto = s.startsWith('mailto:', i) ? 'mailto:' : 'xmpp:';
       const rest = s.slice(i + proto.length);
+      EMAIL_RE.lastIndex = 0;
       const em = EMAIL_RE.exec(rest);
       if (em) {
         let text = proto + em[0];
@@ -503,7 +529,18 @@ function tryUrl(s, i, inLink, nodes) {
   }
   // Bare email. The scanner works left to right, so the earliest match
   // wins; a later `@` can start a new address (`a@b@c.com` -> `b@c.com`).
+  // Cheap pre-check: an email needs an `@` whose local part (all
+  // email-local chars from here) reaches it. Without that, skip the
+  // expensive regex entirely. Use the native indexOf to find the `@`
+  // first, then verify the run-up is all email-local.
   if (isEmailLocal(s[i])) {
+    const at = s.indexOf('@', i);
+    if (at === -1) return null;
+    let ok = true;
+    for (let j = i; j < at; j++) {
+      if (!isEmailLocal(s[j])) { ok = false; break; }
+    }
+    if (!ok) return null;
     const em = matchEmailAt(s, i);
     if (em) {
       // The lookahead may have truncated the address when it is followed
@@ -791,6 +828,9 @@ function scanInline(src, links, st) {
   let textRaw = st.inRaw;
   let inLink = st.inLink;
   let inRaw = st.inRaw;
+  // Index of the next `@` at or after the scan position (-1 = none seen
+  // yet / recompute lazily). Gates bare-email attempts in tryUrl.
+  let nextAt = -1;
 
   const flushText = (end) => {
     if (end > textStart) {
@@ -909,8 +949,18 @@ function scanInline(src, links, st) {
       i += run;
       continue;
     }
-    // Extended autolink.
-    if (ch === 'w' || ch === 'h' || ch === 'f' || ch === 'm' || ch === 'x' || isEmailLocal(ch)) {
+    // Extended autolink. Only try when the character can start one:
+    // `www.`/`http(s)://`/`ftp://`/`mailto:`/`xmpp:` by prefix (either
+    // case — schemes are case-insensitive), or a bare email — which
+    // needs an `@` ahead in this word. Track the next `@` so the common
+    // no-`@` case never calls tryUrl at all. Prefix checks here keep the
+    // common prose words (`have`, `from`, `more`, `with`, ...) from ever
+    // entering tryUrl.
+    if (((ch === 'w' || ch === 'W') && src.startsWith('www.', i)) ||
+        ((ch === 'h' || ch === 'H') && startsSchemeHttp(src, i)) ||
+        ((ch === 'f' || ch === 'F') && startsSchemeFtp(src, i)) ||
+        ((ch === 'm' || ch === 'M') && src.startsWith('mailto:', i)) ||
+        ((ch === 'x' || ch === 'X') && src.startsWith('xmpp:', i))) {
       const url = tryUrl(src, i, inLink, nodes);
       if (url) {
         flushText(i);
@@ -920,6 +970,20 @@ function scanInline(src, links, st) {
         textStart = i;
         textRaw = inRaw;
         continue;
+      }
+    } else if (isEmailLocal(ch)) {
+      if (nextAt === -1 || nextAt < i) nextAt = src.indexOf('@', i);
+      if (nextAt !== -1 && nextAt - i < 65) {
+        const url = tryUrl(src, i, inLink, nodes);
+        if (url) {
+          flushText(i);
+          nodes.push({ l: { href: url.href, title: null, inner: url.text, plain: url.text, img: false, auto: true } });
+          hasLink = true;
+          i = url.end;
+          textStart = i;
+          textRaw = inRaw;
+          continue;
+        }
       }
     }
     i++;
