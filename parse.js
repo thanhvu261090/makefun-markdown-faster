@@ -391,11 +391,13 @@ function tryTag(s, i) {
   if (s[i] !== '<') return null;
   const rest = s.slice(i);
   let m;
-  // Comment: must end with -->.
+  // Comment: must end with -->. `<!-->` and `<!--->` are complete
+  // (empty) comments on their own.
   if (rest.startsWith('<!--')) {
     const end = rest.indexOf('-->');
     if (end === -1) return null;
-    if (rest.startsWith('<!-->') || rest.startsWith('<!--->')) return '<!-->';
+    if (rest.startsWith('<!-->')) return '<!-->';
+    if (rest.startsWith('<!--->')) return '<!--->';
     return rest.slice(0, end + 3);
   }
   // Processing instruction.
@@ -720,10 +722,21 @@ function tryLink(s, i, links, st) {
   let end = -1;
   if (s[after] === '(') {
     const dest = parseLinkDestination(s, after);
-    if (!dest) return null;
-    href = dest.href;
-    title = dest.title;
-    end = dest.end;
+    if (dest) {
+      href = dest.href;
+      title = dest.title;
+      end = dest.end;
+    }
+    // If the inline destination is not valid (e.g. it contains a space),
+    // fall through to the reference-link check: `[foo](not a link)` is
+    // a shortcut reference link when a `[foo]` definition exists.
+    if (!dest) {
+      const def = links[normalizeLabel(labelText)];
+      if (!def) return null;
+      href = def.href;
+      title = def.title;
+      end = after;
+    }
   } else {
     // Reference link: [label][ref], [label][], or [label].
     let ref = null;
@@ -964,6 +977,33 @@ function lastFlankChar(nodes) {
   return '';
 }
 
+// Is the delimiter node at `j` enclosed by a double-delimiter pair of
+// `pairCh` with no other delimiter node in between (marked's
+// emStrongRDelim first alternative: a `*` inside `__...__`, or a `_`
+// inside `**...**`, is skipped by the closer scan)?
+function enclosedByDouble(nodes, j, pairCh) {
+  // Find the nearest preceding double opener of pairCh with only text
+  // between it and j.
+  let a = -1;
+  for (let k = j - 1; k >= 0; k--) {
+    const nd = nodes[k];
+    if (!nd || typeof nd !== 'object' || !nd.d) continue;
+    if (nd.d === pairCh && nd.n >= 2 && nd.op) { a = k; break; }
+    // Any other delimiter node in between breaks the enclosure.
+    break;
+  }
+  if (a === -1) return false;
+  // Find the nearest following double closer of pairCh with only text
+  // between j and it.
+  for (let k = j + 1; k < nodes.length; k++) {
+    const nd = nodes[k];
+    if (!nd || typeof nd !== 'object' || !nd.d) continue;
+    if (nd.d === pairCh && nd.n >= 2 && nd.cl) return true;
+    break;
+  }
+  return false;
+}
+
 // inner opener runs into a pool `m`; a closer run spends from it, and only
 // when the pool is exhausted does it close the opener. A closer that can
 // also open (or an opener that can also close) is skipped when the sum of
@@ -981,6 +1021,10 @@ function resolveEmphasis(nodes) {
     for (let j = i + 1; j < nodes.length; j++) {
       const c = nodes[j];
       if (!c || typeof c !== 'object' || c.d !== ch) continue;
+      // Skip a run enclosed by a double pair of the other character
+      // (a `*` inside `__...__`, or a `_` inside `**...**`): it is
+      // literal text inside that span.
+      if (!isDel && ((ch === '*' && enclosedByDouble(nodes, j, '_')) || (ch === '_' && enclosedByDouble(nodes, j, '*')))) continue;
       if (isDel) {
         // Strikethrough: only runs of exactly the opener's length join
         // the pool (a closer must be the same length; there is no rule
@@ -1730,10 +1774,21 @@ function isParaListStop(line) {
 
 // Collect a paragraph starting at lines[i]: lines until a blank line, a
 // block start, or a table start.
-function collectParagraph(lines, i, end) {
+function collectParagraph(lines, i, end, lazy) {
   let j = i;
   while (j + 1 < end) {
     const next = lines[j + 1];
+    if (isBlank(next)) {
+      // In a blockquote chunk, a trailing spaces-only line (non-empty)
+      // that is the last line of the chunk is part of the paragraph
+      // (the `ge` rule keeps a single trailing blank line); elsewhere a
+      // blank line ends the paragraph.
+      if (lazy && next !== '' && j + 1 === end - 1) { j++; continue; }
+      break;
+    }
+    // A lazy blockquote line is a paragraph continuation even when it
+    // looks like a block start (e.g. a list marker after indent stripping).
+    if (lazy && lazy[j + 1]) { j++; continue; }
     if (paraStopsAt(next)) break;
     if (isTableStart(next, lines[j + 2])) break;
     j++;
@@ -1794,7 +1849,7 @@ function isLoneTagLine(line) {
 // inside blockquotes, false inside list items. `endsNL` is true when the
 // last line of the whole source ends with a newline. Returns
 // {toks, next}. The `links` map is filled with link reference definitions.
-function parseBlocks(lines, i, end, top, links, endsNL) {
+function parseBlocks(lines, i, end, top, links, endsNL, lazy) {
   const toks = [];
   while (i < end) {
     const line = lines[i];
@@ -1805,7 +1860,11 @@ function parseBlocks(lines, i, end, top, links, endsNL) {
       i = j;
       continue;
     }
-    if (indentCols(line) >= 4) {
+    // A lazy blockquote line cannot start a block: it is a paragraph
+    // continuation (or the start of paragraph text). Skip the block
+    // dispatch and fall through to paragraph/text handling.
+    if (!lazy || !lazy[i]) {
+      if (indentCols(line) >= 4) {
       const r = collectCode(lines, i, end, endsNL);
       const prev = toks[toks.length - 1];
       if (prev && (prev.t === 'paragraph' || prev.t === 'text')) prev.text += '\n' + r.text;
@@ -1875,8 +1934,9 @@ function parseBlocks(lines, i, end, top, links, endsNL) {
     }
     const lh = tryLheading(lines, i, end);
     if (lh) { toks.push(lh.tok); i = lh.next; continue; }
+    } // end: not a lazy blockquote line
     if (top) {
-      const r = collectParagraph(lines, i, end);
+      const r = collectParagraph(lines, i, end, lazy);
       toks.push({ t: 'paragraph', text: r.text });
       i = r.next;
       continue;
@@ -2010,7 +2070,16 @@ function parseList(lines, i, end, links, endsNL) {
         if (firstNonSpace(Z) >= R || !f.trim()) {
           d += '\n' + Z.slice(R);
         } else {
-          if (y || firstNonSpace(mm.replace(/\t/g, '    ')) >= 4 || startsBlockAtIndent(mm, maxInd)) break;
+          // A lazy line after a blockquote descends into the blockquote
+          // (it is a lazy continuation of the quote), so a previous line
+          // that is a blockquote does not end the item. Other block
+          // starts do end it.
+          const mmIsQuote = (() => {
+            let s = 0;
+            while (s < mm.length && mm[s] === ' ' && s < maxInd) s++;
+            return s < mm.length && mm[s] === '>';
+          })();
+          if (y || firstNonSpace(mm.replace(/\t/g, '    ')) >= 4 || (!mmIsQuote && startsBlockAtIndent(mm, maxInd))) break;
           let qe = f;
           if (/^ {0,3}(?:=+|-+) *$/.test(f) && isLheadingPair(mm, f)) {
             qe = '    ' + Z.replace(/^ {0,3}/, '');
@@ -2123,20 +2192,38 @@ function lazyStopsAt(line) {
 
 // Strip a blockquote chunk (lines) to its inner content. `>` markers are
 // stripped; a lazy setext-underline line (other than the chunk's first
-// line) is indented by four spaces so it lexes as indented code.
+// line) is indented by four spaces so it lexes as indented code. Returns
+// {lines, lazy}: `lazy[k]` is true when chunkLines[k] had no `>` marker
+// (a lazy continuation line). A lazy line with 4+ columns of indent has
+// that indent stripped (it is a paragraph continuation, not indented
+// code); with less indent nothing is stripped.
 function stripQuoteChunk(chunkLines) {
   const out = [];
+  const lazy = [];
   for (let k = 0; k < chunkLines.length; k++) {
     const line = chunkLines[k];
     if (isQuoteLine(line)) {
       out.push(stripQuoteMarker(line));
+      lazy.push(false);
     } else if (k > 0 && setextLevel(line) > 0) {
       out.push('    ' + line.replace(/^ {0,3}/, ''));
+      lazy.push(false);
+    } else if (indentCols(line) >= 4) {
+      let col = 0;
+      let c = 0;
+      while (c < line.length && col < 4) {
+        if (line[c] === ' ') { col++; c++; }
+        else if (line[c] === '\t') { col += 4 - (col % 4); c++; }
+        else break;
+      }
+      out.push(line.slice(c));
+      lazy.push(true);
     } else {
       out.push(line);
+      lazy.push(true);
     }
   }
-  return out;
+  return { lines: out, lazy };
 }
 
 // Merge a chunk's tokens into the accumulated list: the chunk's first
@@ -2184,8 +2271,12 @@ function parseBlockquote(lines, i, end, links, endsNL) {
     n = n.slice(p);
     consumed += p;
     const stripped = stripQuoteChunk(chunkLines);
-    const chunkEndsNL = (i + consumed - 1 < end - 1) || endsNL;
-    const r = parseBlocks(stripped, 0, stripped.length, true, links, chunkEndsNL);
+    // The chunk ends with a newline iff it is followed by a non-blank
+    // line, or it is the last chunk and the source ends with a newline.
+    // (A following blank line means an html block at the chunk's end has
+    // no trailing newline.)
+    const chunkEndsNL = (i + consumed < end) ? !isBlank(lines[i + consumed]) : endsNL;
+    const r = parseBlocks(stripped.lines, 0, stripped.lines.length, true, links, chunkEndsNL, stripped.lazy);
     mergeChunkTokens(tokens, r.toks);
     if (n.length === 0) break;
     const k = tokens[tokens.length - 1];
